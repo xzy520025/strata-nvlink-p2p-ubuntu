@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+/local-p2p/
+/engine/
+/dist/
+*.private.json
+strata-*.json
+*.log

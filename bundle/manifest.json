@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "version": "0.1.45",
+  "arch": 75,
+  "bundle_id": "4da3526be58d88a2",
+  "package_id": "e97115c4d2b4c958",
+  "source_root": "Strata-0.1.45",
+  "payload_sha256": {
+    "README.zh-CN.md": "54a886ac90cd26125ed620e8b7ce706179e0ad3c25a4147eed66cd7fe26995a2",
+    "SOURCES.json": "f9a3838415d3bc7b7ac6b78859df29763d54aaaacbca8d8ec6d3d9df89669b07",
+    "install.sh": "d7573112cefacaed967b4b4645ca0c988463a3500e0fe2cc2ac491721e187ae3",
+    "installer.py": "416b5ab66afb70b35f15500d059e48cda653afbc8801d620b21701c6435b43b4",
+    "payload/ggml-files.json": "f4a343c948d71d6f1fba8f1c00ae508a43c54a5e31bab647040704e7f55116ea",
+    "payload/ggml.tar.gz": "dc4e0de42908f8124ad61c40fee213f4b6238cb7535623cf418d4038640f0d72",
+    "payload/p2p.patch": "44bac870b0f0fe95f5253d3b7987e7bbcc79c365a1e7c98eba9372f5e4de6309",
+    "payload/upstream.tar.gz": "bb88e14e8b4fa26bf9cc74dc77645576d4ca5d10f5559a95171b0ac3209b33ce",
+    "tests/test_installer.py": "d3c06606aab2f71a7fd9b81d4f5bafbeb4ca929a0bbf4d5172f733954c7d6350"
+  },
+  "patched_files_sha256": {
+    "CMakeLists.txt": "9bb6b502c45e8a5ec27aeb5b83fd1c65011246083fb791eadedb137a11656c7d",
+    "include/strata/core/expert_source.hpp": "cd663fa5c7d8d141995fb9da0216421cb37ba6769cb336eb2d7fa9e8ff66dbd7",
+    "include/strata/core/peer_decode.hpp": "54277649b5127bb1092ac59aa50cea255829492b034e656951012b4c14f1137d",
+    "include/strata/core/peer_experts.hpp": "d123d6332cf089d7412988d813be5eb9c611857d76796ce3a29e416edc10bec4",
+    "include/strata/core/verify.hpp": "9ba81403dcf552d42dc46c90971bb2e8de8de589a747964f7a5ad44cb0d7784c",
+    "src/core/expert_source.cpp": "3a94011e66ea2ca9fda1f0e3e2e35740f609811ba9acc30a24b89b8fdce52ecd",
+    "src/core/peer_decode.cu": "efe22886cbbbc2885970068f3c522d9be41065dc62920185a27a1d2057c56cc8",
+    "src/core/peer_decode_stub.cpp": "fc8bd0352784a567cf10e3a6e11470327bc5ecbf597b80a7546c9f681b9d0a6f",
+    "src/core/peer_experts.cpp": "881abc76da9bdd796fbe35c82248a11473e68fc74a15b6f76ea26f5396d7c000",
+    "src/core/verify.cpp": "0538e2ed85af4a2faf84d3e01d1f2fc7f52ef46c227b32a91f15c64e37ef9a7f",
+    "src/program/generate.cpp": "db5569f089f9185d72ebafdec1cf5e18bc699070b14a6a58674b57b28cb3353d",
+    "tests/core/peer_decode_p2p_test.cpp": "4ecfe9bc3ff86bf8589645fcc46579e7d8b179faddb5f502119827dd4bc295db",
+    "tests/core/peer_ram_dedup_test.cpp": "cd5f25725b1d131abcef7d2a0ced9d930a0411cf3a5adf027475634e3c54625e"
+  }
+}

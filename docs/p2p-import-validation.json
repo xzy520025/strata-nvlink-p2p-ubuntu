@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "completed_at": "2026-10-18T18:17:15.907550+08:00",
+  "archive": "strata-p2p-v0.1.45-ubuntu-sm75-source.tar.gz",
+  "archive_sha256": "4e63de9643cb7bcf5f4fbae7832e78b53098851db51b9fe7efdd49b57f04b9a4",
+  "archive_bytes": 24084797,
+  "source_id": "4da3526be58d88a2",
+  "package_id": "e97115c4d2b4c958",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+  "cuda": "12.8",
+  "arch": 75,
+  "gpus": [
+    "RTX 2080 Ti 22 GiB",
+    "RTX 2080 Ti 22 GiB"
+  ],
+  "interconnect": "NV2",
+  "bidirectional_p2p": true,
+  "installed_engine_sha256": "6dee72aa96ea18871c7820a831215b2ff6b03bd9ae0f58600da17922005a3057",
+  "unit_tests_passed": 18,
+  "fresh_source_build": "passed; final installer also verified using the same source build cache",
+  "gpu_tests": [
+    "peer_decode_p2p_test",
+    "peer_ram_dedup_test"
+  ],
+  "chinese_and_space_paths": true,
+  "read_only_dry_run": true,
+  "split_config_conversion": true,
+  "idempotent_reinstall": true,
+  "backup_permissions": "0700 directory / 0600 config",
+  "byte_exact_rollback": true,
+  "production_config_engine_and_start_script_unchanged": true,
+  "production_health_http": 200,
+  "production_model_loaded": true,
+  "full_model_restarted_for_test": false
+}

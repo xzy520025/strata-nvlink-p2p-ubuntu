@@ -1,0 +1,1742 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d900326e..01b79737 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -556,6 +556,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
++  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
++    target_sources(strata_engine PRIVATE src/core/peer_decode.cu)
++    target_compile_definitions(strata_engine PUBLIC STRATA_PEER_DECODE_P2P=1)
++    if(STRATA_BUILD_TESTS)
++      add_executable(peer_decode_p2p_test tests/core/peer_decode_p2p_test.cpp)
++      target_link_libraries(peer_decode_p2p_test PRIVATE strata_engine)
++      add_test(NAME peer_decode_p2p_test COMMAND peer_decode_p2p_test)
++      set_tests_properties(peer_decode_p2p_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
++    endif()
++  else()
++    target_sources(strata_engine PRIVATE src/core/peer_decode_stub.cpp)
++  endif()
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
+     target_include_directories(host_graph_launch_test PRIVATE include)
+@@ -570,6 +582,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
+     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
+   endif()
++  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/peer_ram_dedup_test.cpp")
++    add_executable(peer_ram_dedup_test tests/core/peer_ram_dedup_test.cpp)
++    target_link_libraries(peer_ram_dedup_test PRIVATE strata_engine)
++    add_test(NAME peer_ram_dedup_test COMMAND peer_ram_dedup_test)
++    set_tests_properties(peer_ram_dedup_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
++  endif()
+ 
+   # available_host_bytes(): MemAvailable, cgroup limits and the operator's --memory-limit-mib cap on fixture directories
+   # - no GPU, no CUDA
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 4850b8b6..9a2f36cd 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -49,6 +49,7 @@ struct ExpertLayout;
+ namespace strata::core {
+ 
+ class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
++struct PeerDecodeView;
+ class RemoteExperts;
+ struct LoadStats;
+ 
+@@ -317,6 +318,7 @@ private:
+ /// after the ring and published before the CPU starts its own share.  Groups of entries that share a blob; the
+ /// blob is a VRAM slot or a pinned host blob read over PCIe.
+ struct GpuPlanSink {
++    PeerDecodeView* peer_decode = nullptr; ///< opt-in, this group's primary device input and P2P result join
+     int32_t* counts = nullptr;             ///< [0] groups, [1] entries
+     int32_t* start = nullptr;              ///< cap + 1
+     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
+diff --git a/include/strata/core/peer_decode.hpp b/include/strata/core/peer_decode.hpp
+new file mode 100644
+index 00000000..1dc31047
+--- /dev/null
++++ b/include/strata/core/peer_decode.hpp
+@@ -0,0 +1,71 @@
++// Optional CUDA peer decode transport. Payloads stay on the GPUs; only control words are mapped host memory.
++#pragma once
++
++#include <cuda_runtime.h>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++class PeerDecodeTransport {
++public:
++    PeerDecodeTransport() = default;
++    ~PeerDecodeTransport();
++    PeerDecodeTransport(const PeerDecodeTransport&) = delete;
++    PeerDecodeTransport& operator=(const PeerDecodeTransport&) = delete;
++
++    // PeerExperts enables access in both contexts first; this component does not change that shared context state.
++    bool open(int primary, int peer, int width, int capacity, int layers, std::string& err);
++    void close();
++    bool valid() const { return primary_ >= 0; }
++    void set_fast_join(bool enabled) { fast_join_ = enabled; } // before open/capture; default keeps the old graph
++    bool fast_join() const { return fast_join_; }
++    bool reset_window(std::string& err); // previous primary window must have completed
++    bool complete(std::string& err);     // after the primary graph has consumed every result
++    void release();                     // abort joins; the instance may never be reused
++    bool drain(std::string& err);
++
++    bool copy_input(float* peer_dst, const float* primary_src, size_t floats, cudaStream_t stream, std::string& err);
++    bool submit(int group, const float* rows, const int32_t* dst, int count, uint32_t sequence,
++                cudaStream_t stream, std::string& err);
++    // Capturable primary-side join and scatter. `skip == sequence` means the primary owns every row.
++    void merge(int group, float* parts, int capacity, uint32_t sequence, const uint32_t* skip, cudaStream_t stream);
++    // Primary rows are zero (or the supplied hits with fast_join); peer rows come from the device packet,
++    // and only CPU rows read host memory. Non-fast callers add their primary hits separately.
++    // fast_join can also join the CPU completion word here, replacing the caller's separate GPU wait.
++    // use_fast_join=false captures the original reader even when the transport supports fast joins.
++    void copy_cpu_rows(int group, float* parts, const float* cpu, int capacity, uint32_t sequence,
++                       const uint32_t* skip, const int32_t* primary_dst, const int32_t* primary_count,
++                       cudaStream_t stream, const float* primary_hits = nullptr, const uint32_t* cpu_ready = nullptr,
++                       bool use_fast_join = true);
++
++    uint64_t input_bytes = 0, output_bytes = 0, submissions = 0;
++    double input_ms = 0, compute_ms = 0, output_ms = 0;
++
++private:
++    int primary_ = -1, peer_ = -1, width_ = 0, capacity_ = 0;
++    size_t header_bytes_ = 0, packet_bytes_ = 0;
++    void* primary_packet_[2] = {};
++    int32_t* primary_owner_[2] = {}; // fast join: map router row to primary/peer/CPU owner
++    uint32_t* join_aborted_[2] = {}; // one mapped abort read at join instead of one per row
++    uint32_t* flags_h_ = nullptr;
++    uint32_t* flags_primary_ = nullptr;
++    uint32_t* flags_peer_ = nullptr;
++    cudaStream_t work_ = nullptr; // borrowed from PeerExperts, outlives this transport
++    struct Trace { cudaEvent_t event[4] = {}; };
++    std::vector<Trace> traces_;
++    size_t trace_used_ = 0;
++    bool timing_ = false, input_pending_ = false;
++    bool fast_join_ = false;
++};
++
++struct PeerDecodeView {
++    PeerDecodeTransport* transport = nullptr;
++    const float* input = nullptr; // normed rows on the primary, stable until merge
++    uint32_t sequence = 0;
++    int group = 0;
++};
++
++} // namespace strata::core
+diff --git a/include/strata/core/peer_experts.hpp b/include/strata/core/peer_experts.hpp
+index a6e3766a..0403de32 100644
+--- a/include/strata/core/peer_experts.hpp
++++ b/include/strata/core/peer_experts.hpp
+@@ -17,6 +17,7 @@
+ 
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/expert_source.hpp"
++#include "strata/core/peer_decode.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -59,11 +60,18 @@ public:
+     /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
+     bool p2p() const { return p2p_; }
+ 
++    /// Startup snapshot for the opt-in RAM complement: neither GPU's experts need a second RAM copy.
++    std::vector<std::pair<int32_t, int32_t>> resident_pairs() const;
++    /// With --peer-ram-dedup, peer evictions exchange their bytes with the incoming expert's RAM place.
++    /// The caller drains the primary's pending exchanges before adapt(); both tiers share the exchange buffers.
++    bool enable_ram_dedup(FileExpertSource& source, std::string& err);
++    bool enable_decode_p2p(std::string& err); // persistent per-group metadata; no allocation in launch
++
+     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
+     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
+     /// out[entry] with a scatter kernel (no D2H copy + host memcpy in finish); STRATA_PEER_DIRECT=0: the old way.
+     bool launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
+-                std::string& err, float* out = nullptr);
++                std::string& err, float* out = nullptr, const PeerDecodeView* decode = nullptr);
+     /// Waits for the launched share and writes its rows into `out` (row i = entry i, n_embd floats).
+     bool finish(float* out, std::string& err);
+ 
+@@ -76,11 +84,13 @@ public:
+     int64_t resident() const { return resident_; }
+     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
+     bool launched_direct() const { return launched_direct_; }
++    bool launched_p2p() const { return launched_p2p_; }
+     double gib() const { return cache_.gib(); }
+     int64_t entries() const { return entries_; }      ///< routed entries the peer computed
+     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
+     int64_t swaps() const { return swaps_; }
+     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
++    double ms_ram_exchange = 0;                       ///< --STRATA_DECODE_TIMING: RAM dedup exchanges
+ 
+ private:
+     int device_ = -1;
+@@ -88,6 +98,7 @@ private:
+     int64_t n_layers_ = 0, n_expert_ = 0;
+     ExpertCache cache_;
+     ExpertSource* src_ = nullptr;
++    FileExpertSource* ram_source_ = nullptr;          ///< opt-in; not owned, survives this peer tier
+     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
+     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
+     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
+@@ -96,11 +107,14 @@ private:
+     float* h_x_ = nullptr;   float* d_x_ = nullptr;   // n_tok x n_embd
+     float* h_out_ = nullptr; float* d_out_ = nullptr; // compact rows
+     void* h_meta_ = nullptr; void* d_meta_ = nullptr; // groups: ptr | start | dst | tok | count
++    void* h_decode_meta_[2] = {};
+     uint8_t* d_q8_ = nullptr;
+     void* d_scratch_ = nullptr;
+     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
+     int64_t launched_rows_ = 0;
+     bool launched_direct_ = false;
++    bool launched_p2p_ = false;
++    bool adapt_ram(const std::vector<std::pair<int32_t, int32_t>>& swaps, std::string& err);
+ };
+ 
+ }  // namespace strata::core
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index a7387236..2a21595b 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -26,6 +26,7 @@
+ #include "strata/core/expert_source.hpp"
+ #include "strata/core/layer.hpp"
+ #include "strata/core/session.hpp"
++#include "strata/core/peer_decode.hpp"
+ #include "strata/kernels/sampler.hpp"
+ 
+ #include <cuda_runtime.h>
+@@ -34,6 +35,7 @@
+ #include <chrono>
+ #include <functional>
+ #include <map>
++#include <memory>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -83,6 +85,8 @@ public:
+     Verifier(const Verifier&) = delete;
+     Verifier& operator=(const Verifier&) = delete;
+     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
++    void set_peer_decode_p2p(int peer, bool fast_join = false) { peer_decode_device_ = peer; peer_fast_join_ = fast_join; } // before init
++    const PeerDecodeTransport* peer_decode_transport() const { return peer_decode_.get(); }
+ 
+     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
+     void diag(std::FILE* f) const;
+@@ -359,6 +363,10 @@ public:
+     std::string profile_report();
+ 
+ private:
++    int peer_decode_device_ = -1;
++    bool peer_fast_join_ = false;
++    std::unique_ptr<PeerDecodeTransport> peer_decode_;
++    PeerDecodeView peer_decode_view_;
+     RemoteExpertOpt* remote_opt_ = nullptr;
+     bool capture(int T, std::string& err);
+     // batch windows (see init_slots)
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d3fefeef..54077ffb 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -3965,7 +3965,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     }
+     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
+         std::string perr;
+-        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
++        const PeerDecodeView* decode = d.plan ? d.plan->peer_decode : nullptr;
++        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out, decode)) {
++            if (decode && decode->transport) decode->transport->release();
+             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+             d.failed = true;
+             d.fail = "the peer GPU's experts could not be launched";
+@@ -4043,9 +4045,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                 if (kind[i] == 0) ++d.cache_hits;
+                 else ++d.offload_entries;                       // #588: PCIe or another GPU
+                 if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+-                // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
++                // A direct peer writes host rows; P2P reads peer rows from its device packet. Neither needs a host zero.
+                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
+-                if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
++                if (!((kind[i] == 2 && d.peer != nullptr && (d.peer->launched_direct() || d.peer->launched_p2p())) ||
+                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
+                     std::memset(row, 0, (size_t) H * sizeof(float));
+                 continue;
+diff --git a/src/core/peer_decode.cu b/src/core/peer_decode.cu
+new file mode 100644
+index 00000000..5f607b67
+--- /dev/null
++++ b/src/core/peer_decode.cu
+@@ -0,0 +1,359 @@
++#include "strata/core/peer_decode.hpp"
++#include "strata/core/on_device.hpp"
++#include "strata/kernels/dp4a.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
++namespace strata::core {
++namespace {
++bool ck(cudaError_t status, const char* what, std::string& err) {
++    if (status == cudaSuccess) return true;
++    err = std::string("peer decode P2P: ") + what + ": " + cudaGetErrorString(status);
++    return false;
++}
++
++__global__ void pack_rows(char* packet, size_t header, const float* rows, const int32_t* dst, int count, int width) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i == 0) ((int32_t*) packet)[0] = count;
++    if (i < count) ((int32_t*) packet)[1 + i] = dst[i];
++    for (int j = i; j < count * width; j += gridDim.x * blockDim.x)
++        ((float*) (packet + header))[j] = rows[j];
++    // packet belongs to the primary GPU. Every writer drains its peer stores before this kernel finishes;
++    // the following stream-ordered completion kernel may then publish the control word.
++    __threadfence_system();
++}
++
++__global__ void read_peer_input(float4* dst, const volatile float4* src, size_t count) {
++    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < count) dst[i] = make_float4(src[i].x, src[i].y, src[i].z, src[i].w);
++}
++
++__global__ void publish_ready(volatile uint32_t* flag, const volatile uint32_t* abort, uint32_t sequence) {
++    __threadfence_system();
++    if (!*abort) *flag = sequence;
++    __threadfence_system();
++}
++
++__global__ void wait_ready(const volatile uint32_t* flag, const volatile uint32_t* abort,
++                           uint32_t sequence, const volatile uint32_t* skip) {
++    if (skip && *skip == sequence) return;
++    while (*flag < sequence && !*abort) strata_spin_pause();
++    __threadfence_system();
++}
++
++__global__ void merge_rows(float* parts, const char* packet, size_t header, int capacity, int width,
++                           volatile uint32_t* abort, uint32_t sequence, const volatile uint32_t* skip) {
++    if (*abort || (skip && *skip == sequence)) return;
++    const int count = ((const int32_t*) packet)[0];
++    if (count < 0 || count > capacity) {
++        if (blockIdx.x == 0 && threadIdx.x == 0) { *abort = 1; __threadfence_system(); }
++        return;
++    }
++    const int row = blockIdx.x;
++    if (row >= count) return;
++    const int dst = ((const int32_t*) packet)[1 + row];
++    if (dst < 0 || dst >= capacity) {
++        if (threadIdx.x == 0) { *abort = 1; __threadfence_system(); }
++        return;
++    }
++    for (int col = threadIdx.x; col < width; col += blockDim.x)
++        parts[(size_t) dst * width + col] = ((const float*) (packet + header))[(size_t) row * width + col];
++}
++
++__global__ void copy_cpu_peer_rows(float4* parts, const volatile float4* cpu, const char* packet, size_t header,
++                                  int capacity, int width4, volatile uint32_t* abort, uint32_t sequence,
++                                  const volatile uint32_t* skip, const int32_t* primary_dst, const int32_t* primary_count) {
++    __shared__ int owner; // -2: aborted, -1: zero primary hit, >=0: peer compact row, -3: CPU
++    const int row = blockIdx.x;
++    if (threadIdx.x == 0) {
++        owner = -3;
++        if (*abort) owner = -2;
++        else if (skip && *skip == sequence) owner = -1;
++        else {
++            const int local = *primary_count;
++            const int peer = ((const int32_t*) packet)[0];
++            if (local < 0 || local > capacity || peer < 0 || peer > capacity) {
++                *abort = 1; __threadfence_system(); owner = -2;
++            } else {
++                for (int q = 0; q < local; ++q) if (primary_dst[q] == row) { owner = -1; break; }
++                if (owner == -3) for (int q = 0; q < peer; ++q)
++                    if (((const int32_t*) packet)[q + 1] == row) { owner = q; break; }
++            }
++        }
++    }
++    __syncthreads();
++    if (owner == -2) return;
++    for (int c = threadIdx.x; c < width4; c += blockDim.x) {
++        float4 value;
++        if (owner == -1) value = make_float4(0, 0, 0, 0);
++        else if (owner >= 0) value = ((const float4*) (packet + header))[(size_t) owner * width4 + c];
++        else {
++            const size_t i = (size_t) row * width4 + c;
++            value = make_float4(cpu[i].x, cpu[i].y, cpu[i].z, cpu[i].w);
++        }
++        parts[(size_t) row * width4 + c] = value;
++    }
++}
++
++// One CTA joins the peer and builds an index. Control words cross PCIe once here, rather than once per row.
++// The packet is immutable until this graph consumes it; the next same-group input depends on these results.
++__global__ void wait_and_index_rows(const volatile uint32_t* flag, volatile uint32_t* abort, uint32_t sequence,
++                                   const volatile uint32_t* skip, const char* packet, int capacity,
++                                   const int32_t* primary_dst, const int32_t* primary_count,
++                                   int32_t* owner, uint32_t* aborted, const volatile uint32_t* cpu_ready) {
++    __shared__ int local, peer, skipped, failed;
++    if (threadIdx.x == 0) {
++        skipped = skip && *skip == sequence;
++        if (!skipped)
++            while ((*flag < sequence || (cpu_ready && *cpu_ready < sequence)) && !*abort) strata_spin_pause();
++        __threadfence_system();
++        failed = *abort != 0;
++        local = peer = 0;
++        if (!failed && !skipped) {
++            local = *primary_count;
++            peer = ((const int32_t*) packet)[0];
++            if (local < 0 || local > capacity || peer < 0 || peer > capacity) {
++                *abort = 1; __threadfence_system(); failed = 1;
++            }
++        }
++        *aborted = (uint32_t) failed;
++    }
++    __syncthreads();
++    if (failed) return;
++    for (int row = threadIdx.x; row < capacity; row += blockDim.x) owner[row] = skipped ? -1 : -3;
++    if (skipped) return;
++    __syncthreads();
++    // Routing entries belong to exactly one tier. Scatter each compact destination once instead of
++    // searching both lists for every row; initialization and scatter stay inside this single CTA.
++    for (int q = threadIdx.x; q < local; q += blockDim.x) {
++        const int row = primary_dst[q];
++        if (row >= 0 && row < capacity) owner[row] = -1;
++        else atomicExch(&failed, 1);
++    }
++    for (int q = threadIdx.x; q < peer; q += blockDim.x) {
++        const int row = ((const int32_t*) packet)[q + 1];
++        if (row >= 0 && row < capacity) owner[row] = q;
++        else atomicExch(&failed, 1);
++    }
++    __syncthreads();
++    if (threadIdx.x == 0 && failed) {
++        *aborted = 1;
++        *abort = 1;
++        __threadfence_system();
++    }
++}
++
++__global__ void fill_indexed_rows(float4* parts, const volatile float4* cpu, const float4* peer,
++                                 const float4* primary_hits, const int32_t* owners, const uint32_t* aborted,
++                                 int width4) {
++    if (*aborted) return;
++    const int row = blockIdx.x;
++    const int owner = owners[row];
++    for (int c = threadIdx.x; c < width4; c += blockDim.x) {
++        const size_t i = (size_t) row * width4 + c;
++        float4 value;
++        if (owner == -1) {
++            value = primary_hits ? primary_hits[i] : make_float4(0, 0, 0, 0);
++            // Preserve the old zero-fill + add_hits arithmetic, including signed zero.
++            value = make_float4(__fadd_rn(0.0f, value.x), __fadd_rn(0.0f, value.y),
++                                __fadd_rn(0.0f, value.z), __fadd_rn(0.0f, value.w));
++        } else if (owner >= 0) value = peer[(size_t) owner * width4 + c];
++        else value = make_float4(cpu[i].x, cpu[i].y, cpu[i].z, cpu[i].w);
++        parts[i] = value;
++    }
++}
++} // namespace
++
++PeerDecodeTransport::~PeerDecodeTransport() { close(); }
++
++bool PeerDecodeTransport::open(int primary, int peer, int width, int capacity, int layers, std::string& err) {
++    close();
++    if (primary < 0 || peer < 0 || primary == peer || width <= 0 || capacity <= 0 || layers <= 0) {
++        err = "peer decode P2P: invalid geometry or devices"; return false;
++    }
++    int a = 0, b = 0;
++    if (!ck(cudaDeviceCanAccessPeer(&a, primary, peer), "query primary access", err) ||
++        !ck(cudaDeviceCanAccessPeer(&b, peer, primary), "query peer access", err)) return false;
++    const char* disabled = std::getenv("STRATA_PEER_NO_P2P");
++    if (!a || !b || (disabled && std::atoi(disabled))) {
++        err = "peer decode P2P: both devices must support direct peer access"; return false;
++    }
++    primary_ = primary; peer_ = peer; width_ = width; capacity_ = capacity;
++    header_bytes_ = ((size_t) (capacity + 1) * sizeof(int32_t) + 15) & ~size_t(15);
++    packet_bytes_ = header_bytes_ + (size_t) capacity * width * sizeof(float);
++    timing_ = std::getenv("STRATA_DECODE_TIMING") != nullptr;
++    {
++        OnDevice on(primary_);
++        for (int g = 0; g < 2; ++g) {
++            void** dst = &primary_packet_[g];
++            if (!ck(cudaMalloc(dst, packet_bytes_), "allocate packet", err) ||
++                !ck(cudaMemset(*dst, 0, packet_bytes_), "initialize packet", err)) { close(); return false; }
++            if (fast_join_ &&
++                (!ck(cudaMalloc((void**) &primary_owner_[g], capacity * sizeof(int32_t)), "row owner index", err) ||
++                 !ck(cudaMalloc((void**) &join_aborted_[g], sizeof(uint32_t)), "join state", err))) { close(); return false; }
++        }
++    }
++    {
++        OnDevice on(primary_);
++        if (!ck(cudaHostAlloc((void**) &flags_h_, 192, cudaHostAllocMapped | cudaHostAllocPortable), "control words", err) ||
++            !ck(cudaHostGetDevicePointer((void**) &flags_primary_, flags_h_, 0), "primary control alias", err)) {
++            close(); return false;
++        }
++        for (int i = 0; i < 48; ++i) flags_h_[i] = 0;
++    }
++    {
++        OnDevice on(peer_);
++        if (!ck(cudaHostGetDevicePointer((void**) &flags_peer_, flags_h_, 0), "peer control alias", err)) {
++            close(); return false;
++        }
++        if (timing_) {
++            traces_.resize((size_t) layers * 2);
++            for (auto& trace : traces_) for (auto& event : trace.event)
++                if (!ck(cudaEventCreate(&event), "timing event", err)) { close(); return false; }
++        }
++    }
++    std::fprintf(stderr, "strata verify: peer decode P2P CUDA%d <-> CUDA%d, %.2f MiB packets on the primary, "
++                         "peer kernel loads/stores and GPU-side result join%s\n", primary_, peer_, 2.0 * packet_bytes_ / (1 << 20),
++                         timing_ ? " (timing on)" : "");
++    return true;
++}
++
++void PeerDecodeTransport::release() {
++    if (!flags_h_) return;
++    *(volatile uint32_t*) (flags_h_ + 32) = 1;
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    *(volatile uint32_t*) flags_h_ = UINT32_MAX;
++    *(volatile uint32_t*) (flags_h_ + 16) = UINT32_MAX;
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++}
++
++bool PeerDecodeTransport::drain(std::string& err) {
++    if (peer_ < 0 || !work_) return true;
++    OnDevice on(peer_);
++    return ck(cudaStreamSynchronize(work_), "drain", err);
++}
++
++void PeerDecodeTransport::close() {
++    if (primary_ < 0) return;
++    release();
++    std::string ignored;
++    drain(ignored);
++    for (int device : {primary_, peer_}) {
++        OnDevice on(device);
++        if (device == primary_) for (int g = 0; g < 2; ++g) {
++            void*& ptr = primary_packet_[g];
++            if (ptr) cudaFree(ptr);
++            ptr = nullptr;
++            if (primary_owner_[g]) cudaFree(primary_owner_[g]);
++            if (join_aborted_[g]) cudaFree(join_aborted_[g]);
++            primary_owner_[g] = nullptr; join_aborted_[g] = nullptr;
++        }
++        if (device == peer_) for (auto& trace : traces_) for (auto event : trace.event)
++            if (event) cudaEventDestroy(event);
++    }
++    if (flags_h_) cudaFreeHost(flags_h_);
++    flags_h_ = flags_primary_ = flags_peer_ = nullptr;
++    traces_.clear();
++    work_ = nullptr; primary_ = peer_ = -1; trace_used_ = 0; input_pending_ = false;
++}
++
++bool PeerDecodeTransport::reset_window(std::string& err) {
++    if (!valid() || !flags_h_ || *(volatile uint32_t*) (flags_h_ + 32)) {
++        err = "peer decode P2P: an aborted transport cannot be reused"; return false;
++    }
++    *(volatile uint32_t*) flags_h_ = 0;
++    *(volatile uint32_t*) (flags_h_ + 16) = 0;
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    trace_used_ = 0; input_pending_ = false;
++    return true;
++}
++
++bool PeerDecodeTransport::copy_input(float* dst, const float* src, size_t floats, cudaStream_t stream, std::string& err) {
++    if (!valid() || !flags_h_ || *(volatile uint32_t*) (flags_h_ + 32) || input_pending_ ||
++        floats > (size_t) capacity_ * width_ || (floats && (!src || !dst))) {
++        err = "peer decode P2P: invalid input submission"; return false;
++    }
++    work_ = stream;
++    if (timing_ && trace_used_ >= traces_.size()) { err = "peer decode P2P: too many layer groups"; return false; }
++    if (timing_ && !ck(cudaEventRecord(traces_[trace_used_].event[0], stream), "input start", err)) return false;
++    if (floats % 4) { err = "peer decode P2P: input must contain full float4 rows"; return false; }
++    if (floats) {
++        read_peer_input<<<(unsigned) ((floats / 4 + 255) / 256), 256, 0, stream>>>((float4*) dst, (const volatile float4*) src, floats / 4);
++        if (!ck(cudaPeekAtLastError(), "input peer load", err)) return false;
++    }
++    if (timing_ && !ck(cudaEventRecord(traces_[trace_used_].event[1], stream), "input end", err)) return false;
++    input_bytes += floats * sizeof(float);
++    input_pending_ = true;
++    return true;
++}
++
++bool PeerDecodeTransport::submit(int group, const float* rows, const int32_t* dst, int count, uint32_t sequence,
++                                 cudaStream_t stream, std::string& err) {
++    if (!valid() || !input_pending_ || group < 0 || group > 1 || count < 0 || count > capacity_ ||
++        !sequence || sequence == UINT32_MAX || (count && (!rows || !dst))) {
++        err = "peer decode P2P: invalid result submission"; return false;
++    }
++    if (timing_ && !ck(cudaEventRecord(traces_[trace_used_].event[2], stream), "compute end", err)) return false;
++    const int blocks = std::max(1, (count * width_ + 255) / 256);
++    pack_rows<<<blocks, 256, 0, stream>>>((char*) primary_packet_[group], header_bytes_, rows, dst, count, width_);
++    if (!ck(cudaPeekAtLastError(), "pack", err)) return false;
++    const size_t bytes = header_bytes_ + (size_t) count * width_ * sizeof(float);
++    if (timing_ && !ck(cudaEventRecord(traces_[trace_used_].event[3], stream), "output end", err)) return false;
++    publish_ready<<<1, 1, 0, stream>>>(flags_peer_ + group * 16, flags_peer_ + 32, sequence);
++    if (!ck(cudaPeekAtLastError(), "publish result", err)) return false;
++    // Flush the launch queue once, as Verifier does after cudaGraphLaunch. Without this the host can finish
++    // its CPU share and spin on the primary's next doorbell while the peer's last launches are still buffered.
++    const cudaError_t queued = cudaStreamQuery(stream);
++    if (queued != cudaSuccess && queued != cudaErrorNotReady && !ck(queued, "submit queue", err)) return false;
++    output_bytes += bytes; ++submissions; ++trace_used_; input_pending_ = false;
++    return true;
++}
++
++void PeerDecodeTransport::merge(int group, float* parts, int capacity, uint32_t sequence,
++                                const uint32_t* skip, cudaStream_t stream) {
++    wait_ready<<<1, 1, 0, stream>>>(flags_primary_ + group * 16, flags_primary_ + 32, sequence, skip);
++    merge_rows<<<capacity, 256, 0, stream>>>(parts, (const char*) primary_packet_[group], header_bytes_, capacity, width_,
++                                           flags_primary_ + 32, sequence, skip);
++}
++
++void PeerDecodeTransport::copy_cpu_rows(int group, float* parts, const float* cpu, int capacity, uint32_t sequence,
++                                        const uint32_t* skip, const int32_t* primary_dst, const int32_t* primary_count,
++                                        cudaStream_t stream, const float* primary_hits, const uint32_t* cpu_ready,
++                                        bool use_fast_join) {
++    if (fast_join_ && use_fast_join) {
++        wait_and_index_rows<<<1, 128, 0, stream>>>(flags_primary_ + group * 16, flags_primary_ + 32, sequence,
++            skip, (const char*) primary_packet_[group], capacity, primary_dst, primary_count,
++            primary_owner_[group], join_aborted_[group], cpu_ready);
++        fill_indexed_rows<<<capacity, 256, 0, stream>>>((float4*) parts, (const volatile float4*) cpu,
++            (const float4*) ((const char*) primary_packet_[group] + header_bytes_), (const float4*) primary_hits,
++            primary_owner_[group], join_aborted_[group], width_ / 4);
++        return;
++    }
++    wait_ready<<<1, 1, 0, stream>>>(flags_primary_ + group * 16, flags_primary_ + 32, sequence, skip);
++    copy_cpu_peer_rows<<<capacity, 256, 0, stream>>>((float4*) parts, (const volatile float4*) cpu,
++        (const char*) primary_packet_[group], header_bytes_, capacity, width_ / 4,
++        flags_primary_ + 32, sequence, skip, primary_dst, primary_count);
++}
++
++bool PeerDecodeTransport::complete(std::string& err) {
++    if (!flags_h_ || *(volatile uint32_t*) (flags_h_ + 32)) {
++        err = "peer decode P2P: the transport was aborted"; return false;
++    }
++    if (timing_) {
++        OnDevice on(peer_);
++        if (!drain(err)) return false;
++        for (size_t i = 0; i < trace_used_; ++i) {
++            float a = 0, b = 0, c = 0;
++            if (!ck(cudaEventElapsedTime(&a, traces_[i].event[0], traces_[i].event[1]), "input elapsed", err) ||
++                !ck(cudaEventElapsedTime(&b, traces_[i].event[1], traces_[i].event[2]), "compute elapsed", err) ||
++                !ck(cudaEventElapsedTime(&c, traces_[i].event[2], traces_[i].event[3]), "output elapsed", err)) return false;
++            input_ms += a; compute_ms += b; output_ms += c;
++        }
++        trace_used_ = 0;
++    }
++    return true;
++}
++} // namespace strata::core
+diff --git a/src/core/peer_decode_stub.cpp b/src/core/peer_decode_stub.cpp
+new file mode 100644
+index 00000000..a2f790d3
+--- /dev/null
++++ b/src/core/peer_decode_stub.cpp
+@@ -0,0 +1,15 @@
++// Other backends keep the host transport. The CUDA feature is explicitly rejected at startup.
++#include "strata/core/peer_decode.hpp"
++namespace strata::core {
++PeerDecodeTransport::~PeerDecodeTransport() = default;
++bool PeerDecodeTransport::open(int, int, int, int, int, std::string& e) { e = "peer decode P2P requires CUDA"; return false; }
++void PeerDecodeTransport::close() {}
++bool PeerDecodeTransport::reset_window(std::string&) { return false; }
++bool PeerDecodeTransport::complete(std::string&) { return false; }
++void PeerDecodeTransport::release() {}
++bool PeerDecodeTransport::drain(std::string&) { return true; }
++bool PeerDecodeTransport::copy_input(float*, const float*, size_t, cudaStream_t, std::string&) { return false; }
++bool PeerDecodeTransport::submit(int, const float*, const int32_t*, int, uint32_t, cudaStream_t, std::string&) { return false; }
++void PeerDecodeTransport::merge(int, float*, int, uint32_t, const uint32_t*, cudaStream_t) {}
++void PeerDecodeTransport::copy_cpu_rows(int, float*, const float*, int, uint32_t, const uint32_t*, const int32_t*, const int32_t*, cudaStream_t, const float*, const uint32_t*, bool) {}
++}
+diff --git a/src/core/peer_experts.cpp b/src/core/peer_experts.cpp
+index ee0c2d0c..fb301c92 100644
+--- a/src/core/peer_experts.cpp
++++ b/src/core/peer_experts.cpp
+@@ -107,6 +107,7 @@ void PeerExperts::close() {
+         if (h_x_) cudaFreeHost(h_x_);
+         if (h_out_) cudaFreeHost(h_out_);
+         if (h_meta_) cudaFreeHost(h_meta_);
++        for (void*& meta : h_decode_meta_) { if (meta) cudaFreeHost(meta); meta = nullptr; }
+         if (refill_ev_) cudaEventDestroy(refill_ev_);
+         if (stream_) cudaStreamDestroy(stream_);
+         if (refill_) cudaStreamDestroy(refill_);
+@@ -116,9 +117,33 @@ void PeerExperts::close() {
+     d_q8_ = nullptr;
+     stream_ = refill_ = nullptr;
+     refill_ev_ = nullptr;
++    ram_source_ = nullptr;
+     device_ = -1;
+ }
+ 
++std::vector<std::pair<int32_t, int32_t>> PeerExperts::resident_pairs() const {
++    std::vector<std::pair<int32_t, int32_t>> result;
++    if (!valid()) return result;
++    for (int64_t l = 0; l < n_layers_; ++l)
++        for (int64_t e = 0; e < n_expert_; ++e)
++            if (has(l, e)) result.emplace_back((int32_t) l, (int32_t) e);
++    return result;
++}
++
++bool PeerExperts::enable_ram_dedup(FileExpertSource& source, std::string& err) {
++    if (!valid() || src_ != &source || !source.complement_ready() || !pending_.empty()) {
++        err = "peer RAM dedup: needs this peer's ready RAM complement and no pending swaps";
++        return false;
++    }
++    for (const auto& [l, e] : resident_pairs())
++        if (source.has_resident(l, e)) {
++            err = "peer RAM dedup: the RAM complement still contains a peer expert";
++            return false;
++        }
++    ram_source_ = &source;
++    return true;
++}
++
+ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
+                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
+                        std::string& err) {
+@@ -235,16 +260,33 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
+     return true;
+ }
+ 
++bool PeerExperts::enable_decode_p2p(std::string& err) {
++#if defined(STRATA_PEER_DECODE_P2P)
++    if (!valid() || !p2p_) { err = "peer decode P2P requires direct access in both directions"; return false; }
++    On on(device_);
++    for (void*& meta : h_decode_meta_)
++        if (!meta && !ck(cudaHostAlloc(&meta, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "decode metadata", err)) return false;
++    return true;
++#else
++    err = "peer decode P2P requires the CUDA backend";
++    return false;
++#endif
++}
++
+ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
+-                         const int32_t* kind, std::string& err, float* out) {
++                         const int32_t* kind, std::string& err, float* out, const PeerDecodeView* decode) {
+     static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
+-    const bool direct = direct_env && out != nullptr;
++    const bool direct = !decode && direct_env && out != nullptr;
+     launched_direct_ = false;
++    launched_p2p_ = false;
+     launched_rows_ = 0;
+     row_of_.clear();
+     const int64_t n = n_tok * k;
+     if (n > CAP) { err = "peer experts: window too large"; return false; }
+-    Meta& m = *(Meta*) h_meta_;
++    if (decode && (decode->group < 0 || decode->group > 1 || !h_decode_meta_[decode->group] || !decode->transport)) {
++        err = "peer decode P2P: unconfigured layer group"; return false;
++    }
++    Meta& m = *(Meta*) (decode ? h_decode_meta_[decode->group] : h_meta_);
+     int groups = 0, rows = 0;
+     // distinct experts in routing order; each one's entries become compact rows
+     for (int64_t i = 0; i < n; ++i) {
+@@ -268,21 +310,29 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
+         ++groups;
+         ++experts_;
+     }
+-    if (groups == 0) return true;
++    if (groups == 0) {
++        if (!decode) return true;
++        On on(device_);
++        launched_p2p_ = true;
++        return decode->transport->copy_input(nullptr, nullptr, 0, stream_, err) &&
++               decode->transport->submit(decode->group, nullptr, nullptr, 0, decode->sequence, stream_, err);
++    }
+     m.start[groups] = rows;
+     m.count[0] = groups;
+     m.count[1] = rows;
+     entries_ += rows;
+     launched_rows_ = rows;
+     // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
+-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
++    if (!decode && !direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+     On on(device_);
+     const cudaStream_t s = stream_;
+-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
++    const bool input_ok = decode ? decode->transport->copy_input(d_x_, decode->input, (size_t) (n_tok * H), s, err)
++        : ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err);
++    if (!input_ok || !ck(cudaMemcpyAsync(d_meta_, &m, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+         return false;
+     Meta* dm = (Meta*) d_meta_;
+     const auto& lay = strata::kernels::cpu::expert_layout();
++    try {
+     if (lay.native) {
+         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+         const auto& f = lay.fmt[(size_t) layer];
+@@ -293,6 +343,11 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
+         err = "peer experts: only native packs are supported";
+         return false;
+     }
++    } catch (const std::exception& e) { err = std::string("peer experts: ") + e.what(); return false; }
++    if (decode) {
++        launched_p2p_ = true;
++        return decode->transport->submit(decode->group, d_out_, dm->out_row, rows, decode->sequence, s, err);
++    }
+     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
+         try {
+             strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+@@ -305,6 +360,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
+ }
+ 
+ bool PeerExperts::finish(float* out, std::string& err) {
++    if (launched_p2p_) { launched_rows_ = 0; return true; } // the primary graph, not the host, joins this result
+     if (launched_rows_ == 0) return true;
+     const auto t0 = std::chrono::steady_clock::now();
+     {
+@@ -337,7 +393,8 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps,
+         const int32_t* r1 = res_.data() + l * n_expert_;
+         for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
+             if (r1[e] >= 0) vict.emplace_back(u[e], e);
+-            else if (r0[e] < 0 && u[e] >= 2.0f) cand.emplace_back(u[e], e);
++            else if (r0[e] < 0 && u[e] >= 2.0f &&
++                     (!ram_source_ || ram_source_->has_resident(l, e))) cand.emplace_back(u[e], e);
+         }
+         if (cand.empty() || vict.empty()) continue;
+         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+@@ -352,6 +409,16 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps,
+     if (swaps.empty()) return true;
+     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+     if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
++    if (ram_source_) {
++        // Exchange one RAM place per peer slot. File-only candidates wait for a later round; they have no RAM
++        // place into which an eviction could move. The original peer path remains unchanged without the switch.
++        std::vector<std::pair<int32_t, int32_t>> pairs;
++        pairs.reserve(swaps.size());
++        for (const Swap& s : swaps)
++            pairs.emplace_back((int32_t) (s.layer * n_expert_ + s.in),
++                               (int32_t) (s.layer * n_expert_ + s.out));
++        return adapt_ram(pairs, err);
++    }
+     On on(device_);
+     for (const Swap& s : swaps) {
+         const size_t in = (size_t) (s.layer * n_expert_ + s.in), out = (size_t) (s.layer * n_expert_ + s.out);
+@@ -368,6 +435,60 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps,
+     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
+ }
+ 
++bool PeerExperts::adapt_ram(const std::vector<std::pair<int32_t, int32_t>>& swaps, std::string& err) {
++    // Called between verify windows, after the primary's exchanges have committed. Keep the peer and RAM
++    // residency unchanged until both copies finish; no window can read a slot while it is overwritten.
++    const auto& lay = strata::kernels::cpu::expert_layout();
++    const size_t count = std::min(swaps.size(), (size_t) ram_source_->exchange_capacity());
++    if (count == 0) return true;
++    struct Timer {
++        double& total;
++        bool on;
++        std::chrono::steady_clock::time_point start;
++        Timer(double& ms) : total(ms), on(std::getenv("STRATA_DECODE_TIMING") != nullptr) {
++            if (on) start = std::chrono::steady_clock::now();
++        }
++        ~Timer() { if (on) total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
++    } timer(ms_ram_exchange);
++    On on(device_);
++    for (size_t q = 0; q < count; ++q) {
++        const auto [in, out] = swaps[q];
++        const int64_t l = in / n_expert_;
++        if (out / n_expert_ != l || res_[(size_t) out] < 0 ||
++            !ram_source_->has_resident(l, in % n_expert_) || ram_source_->has_resident(l, out % n_expert_)) {
++            err = "peer RAM dedup: invalid exchange ownership";
++            return false;
++        }
++        if (!ck(cudaMemcpyAsync(ram_source_->exchange_buffer((int64_t) q), cache_.device_slot(res_[(size_t) out]),
++                                (size_t) lay.blob_bytes(l), cudaMemcpyDeviceToHost, refill_), "eviction", err))
++            return false;
++    }
++    if (!ck(cudaStreamSynchronize(refill_), "eviction sync", err)) return false;
++    for (size_t q = 0; q < count; ++q) {
++        const auto [in, out] = swaps[q];
++        const int64_t l = in / n_expert_;
++        if (!ram_source_->stage_exchange(l, in % n_expert_, out % n_expert_, (int64_t) q)) {
++            err = "peer RAM dedup: could not stage the RAM ownership exchange";
++            return false;
++        }
++        const uint8_t* b = ram_source_->resident_blob(l, in % n_expert_);
++        if (!b || !ck(cudaMemcpyAsync(cache_.device_slot(res_[(size_t) out]), b, (size_t) lay.blob_bytes(l),
++                                     cudaMemcpyHostToDevice, refill_), "deduplicated refill", err)) return false;
++    }
++    if (!ck(cudaStreamSynchronize(refill_), "deduplicated refill sync", err)) return false;
++    if (ram_source_->commit_exchanges() != (int64_t) count) {
++        err = "peer RAM dedup: the RAM ownership exchange did not commit";
++        return false;
++    }
++    for (size_t q = 0; q < count; ++q) {
++        const auto [in, out] = swaps[q];
++        res_[(size_t) in] = res_[(size_t) out];
++        res_[(size_t) out] = kNotResident;
++        ++swaps_;
++    }
++    return true;
++}
++
+ void PeerExperts::apply_pending(bool wait) {
+     if (pending_.empty()) return;
+     {
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 64ffc92a..1e98734d 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -464,6 +464,7 @@ const int64_t g_test_drop = [] {
+ 
+ bool Verifier::release_gpu_waits(int timeout_ms) {
+     released_.store(true);
++    if (peer_decode_) peer_decode_->release();
+     trace_ev("RELEASE", -1, -1, timeout_ms);
+     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
+     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
+@@ -484,6 +485,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+         }
+     }
++    if (peer_decode_) { std::string ignored; if (!peer_decode_->drain(ignored)) return false; }
+     trace_ev("RELEASE-DRAINED", -1, -1, (int64_t) ms_since(t0));   // aux: ms the GPU took to finish once released
+     return true;
+ }
+@@ -560,6 +562,7 @@ void Verifier::diag(std::FILE* f) const {
+ 
+ 
+ Verifier::~Verifier() {
++    if (peer_decode_) peer_decode_->release();
+ #if defined(STRATA_GPU_METAL)
+     strata::metal_engine::window_destroy(metal_);
+     metal_ = nullptr;
+@@ -571,6 +574,7 @@ Verifier::~Verifier() {
+         slot.compare_exchange_strong(me, nullptr);
+     }
+     if (cs_) cudaStreamSynchronize(cs_);
++    peer_decode_.reset(); // peer DMA must drain before the primary's input buffers are freed
+     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+     for (auto& e : exec_)
+         if (e) cudaGraphExecDestroy(e);
+@@ -732,6 +736,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         bal_ok_.assign((size_t) g.n_layers * 2, 0);
+         bal_->on = true;
+     }
++    if (peer_decode_device_ >= 0) {
++        peer_decode_ = std::make_unique<PeerDecodeTransport>();
++        peer_decode_->set_fast_join(peer_fast_join_);
++        if (!peer_decode_->open(device_, peer_decode_device_, (int) N, (int) (T * K), (int) g.n_layers, err)) return false;
++    }
+     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
+     {
+         const int64_t cap = (int64_t) (T * K);
+@@ -1956,6 +1965,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
+         float* hit_out = hit_out_ + (size_t) tb * K * N;
+         float* parts_out = parts_ + (size_t) tb * K * N;
++        // This switch targets concurrent slots. Keep solo MTP and short-prompt graphs unchanged even
++        // when it is enabled, so their cache warm-up and decode use the established transport path.
++        const bool fast_peer_join = batch_rec_ && peer_decode_ && peer_decode_->fast_join();
+         const auto& lay = strata::kernels::cpu::expert_layout();
+         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
+         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
+@@ -2009,7 +2021,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
+             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+             stamp(l, 22, grp);
+-            if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
++            if (peer_decode_) {
++                if (!fast_peer_join) {
++                    if (device_plan_) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
++                    else wait_flag_ge(m_flag_, ring, cs);
++                }
++                stamp(l, 23, grp);
++                peer_decode_->copy_cpu_rows(grp, parts_out, m_ymiss_ + (size_t) tb * K * N, (int) cap, ring,
++                    device_plan_ ? skip_ + grp : nullptr, p_dst, p_counts + 1, cs, hit_out,
++                    fast_peer_join ? m_flag_ : nullptr, fast_peer_join);
++            } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
+                                          skip_ + grp, ring, cs);
+@@ -2034,10 +2055,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+             }
+             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
+-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
++            hits_in_combine = !fast_peer_join && fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+                               native_moe_combine_enabled() && n <= 8 &&
+                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+-            if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
++            if (!fast_peer_join && !hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+         }
+         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
+         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
+@@ -2631,6 +2652,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
+     ms_host += ms_since(t0);
+     if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
++    if (peer_decode_ && !peer_decode_->reset_window(err)) return false;
+     // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
+     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+@@ -2696,6 +2718,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         VDBG("staged; launching\n");
+         if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+         if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
++        if (peer_decode_ && !peer_decode_->reset_window(err)) return false;
+         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
+         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+@@ -2905,6 +2928,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+     trace_ev("SYNCED", -1, -1, (int64_t) se);
+     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
++    if (peer_decode_ && !peer_decode_->complete(err)) return false;
+     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
+         *(volatile uint32_t*) h_plan_err_ = 0;
+         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
+@@ -3011,6 +3035,11 @@ void Verifier::set_plan_slot(int grp) {
+     sink_.ptr2 = sink_.ptr + cap;
+     sink_.start2 = base + ptr_off + 4 * cap;
+     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
++    if (peer_decode_) {
++        const int tb = grp == 0 ? 0 : (last_t_ + 1) / 2;
++        peer_decode_view_ = {peer_decode_.get(), mixed_ + (size_t) tb * g_->n_embd, cur_layer_ + 1, grp};
++        sink_.peer_decode = &peer_decode_view_;
++    }
+     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+     sink_.staging_cap = per;
+@@ -3546,6 +3575,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+     const ModelGeometry& g = *g_;
+     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
++    if (peer_decode_ && !peer_decode_->reset_window(err)) return false;
+     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
+     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+     (void) cudaStreamQuery(cs_);
+@@ -3632,6 +3662,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+     }
+     const cudaError_t se = cudaStreamSynchronize(cs_);
+     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
++    if (peer_decode_ && !peer_decode_->complete(err)) return false;
+     cudaStreamSynchronize(copy_);
+     if (prof_on_) collect_profile();
+     ++windows;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index aae51631..4bb51c6c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -558,6 +558,9 @@ struct Options {
+     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
+     /// (-1 = adapt_swaps).
+     int peer_device = -1;
++    bool peer_ram_dedup = false;     ///< opt-in: exclude peer experts from RAM and exchange evictions back safely
++    bool peer_decode_p2p = false;    ///< opt-in: device-to-device decode payloads with a GPU-side result join
++    bool peer_decode_fast_join = false; ///< opt-in: indexed, fused primary/peer/CPU row fill
+     int peer_reserve_mib = 600;
+     int64_t peer_slots = 0;
+     int peer_adapt_swaps = -1;
+@@ -655,6 +658,8 @@ struct Options {
+     bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
+     bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
+     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
++    int batch_adapt_every = 0;   ///< opt-in: update both peer caches between completed batch windows
++    int batch_adapt_swaps = 32;  ///< independent of the solo path's swap budget; at most 96
+     std::string spec_oracle;
+     int spec_corrupt = 0;
+     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
+@@ -984,6 +989,13 @@ void usage() {
+                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
+                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
+                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
++                 "  --peer-ram-dedup     --serve with --peer-device and resident RAM: exclude both GPUs' experts\n"
++                 "                       from RAM; serialize adaptive ownership exchanges (default off)\n"
++                 "  --peer-decode-p2p    --serve: CUDA P2P decode inputs/results; GPU joins the peer (default off)\n"
++                 "  --peer-decode-fast-join  --peer-decode-p2p: indexed, fused batch result fill (solo unchanged; off)\n"
++                 "  --batch-adapt-every N  --serve --batch with peer resident RAM: update caches every N windows\n"
++                 "                       (0 = off, default); updates finish between windows\n"
++                 "  --batch-adapt-swaps N  per-card batch update limit, 1..96 (default 32); solo limit unchanged\n"
+                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
+                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
+                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
+@@ -2586,6 +2598,21 @@ int main(int argc, char** argv) {
+         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
+         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
+         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
++        else if (a == "--peer-ram-dedup") o.peer_ram_dedup = true;
++        else if (a == "--peer-decode-p2p") o.peer_decode_p2p = true;
++        else if (a == "--peer-decode-fast-join") o.peer_decode_fast_join = true;
++        else if (a == "--batch-adapt-every" || a == "--batch-adapt-swaps") {
++            const char* v = next(a.c_str());
++            char* end = nullptr;
++            const long n = std::strtol(v, &end, 10);
++            const bool every = a == "--batch-adapt-every";
++            if (end == v || *end != '\0' || n < (every ? 0 : 1) || n > (every ? 1000000 : 96)) {
++                std::fprintf(stderr, "strata generate: %s expects an integer in %s\n", a.c_str(), every ? "0..1000000" : "1..96");
++                return 2;
++            }
++            if (every) o.batch_adapt_every = (int) n;
++            else o.batch_adapt_swaps = (int) n;
++        }
+         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
+         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
+         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
+@@ -3144,6 +3171,29 @@ int main(int argc, char** argv) {
+                                             : "--expert-cache-device1..3 (the peer tier already caches experts there)");
+         return 2;
+     }
++    if (o.peer_ram_dedup && (!o.serve || o.peer_device < 1 || !o.resident_cpu_experts)) {
++        std::fprintf(stderr, "strata generate: --peer-ram-dedup requires --serve, --peer-device and "
++                             "--resident-experts or --resident-budget-gib\n");
++        return 2;
++    }
++    if (o.peer_decode_p2p && (!o.serve || o.peer_device < 1)) {
++        std::fprintf(stderr, "strata generate: --peer-decode-p2p requires --serve and --peer-device\n");
++        return 2;
++    }
++    if (o.peer_decode_fast_join && !o.peer_decode_p2p) {
++        std::fprintf(stderr, "strata generate: --peer-decode-fast-join requires --peer-decode-p2p\n");
++        return 2;
++    }
++    if (o.batch_adapt_every > 0 && (!o.serve || o.batch < 2 || o.peer_device < 1 || !o.resident_cpu_experts)) {
++        std::fprintf(stderr, "strata generate: --batch-adapt-every requires --serve, --batch >=2, --peer-device and resident RAM\n");
++        return 2;
++    }
++#if !defined(STRATA_PEER_DECODE_P2P)
++    if (o.peer_decode_p2p) {
++        std::fprintf(stderr, "strata generate: --peer-decode-p2p requires the CUDA backend\n");
++        return 2;
++    }
++#endif
+ 
+     if (o.native_flash_attn_short && o.max_context > 256) {
+         std::fprintf(stderr, "strata generate: --native-flash-attn-short requires --max-context <=256\n");
+@@ -6375,6 +6425,9 @@ int main(int argc, char** argv) {
+     }
+ 
+     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
++    if (o.peer_decode_p2p && !peer.enable_decode_p2p(err)) {
++        std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
++    }
+     Drive drive;
+     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
+     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
+@@ -7630,6 +7683,12 @@ int main(int argc, char** argv) {
+                 for (int64_t e = 0; e < g.n_expert; ++e)
+                     if (remote_experts[(size_t) r].holds(l, (int32_t) e)) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+         }
++        if (o.peer_ram_dedup) {
++            const auto pairs = peer.resident_pairs();
++            stage_pairs.insert(stage_pairs.end(), pairs.begin(), pairs.end());
++            std::fprintf(stderr, "strata generate: peer RAM dedup: %zu peer experts excluded from the RAM copy\n",
++                         pairs.size());
++        }
+         // The split's lend regions.  The serve scan lends the tail slots of EVERY part's cache - CUDA0's own
+         // part first, then every stage (the `pf_parts` loop below) - and `lend_from` above is switched off in
+         // pin_cache_complement the moment `additional_gpu_pairs` is non-empty, so until now none of those experts
+@@ -7733,6 +7792,10 @@ int main(int argc, char** argv) {
+                          o.resident_budget > 0 ? "A larger --resident-budget-gib (the lend region comes after the ranked experts), or a smaller --prefill,"
+                                                : "A smaller --prefill, or auto,");
+         if (resident_ok) {
++            if (o.peer_ram_dedup && !peer.enable_ram_dedup(src, err)) {
++                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
++                return 1;
++            }
+             // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
+             // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
+             if (o.adapt_async && !src.reserve_exchanges(2 * std::min<int64_t>(o.adapt_swaps, 96), err,
+@@ -7742,8 +7805,10 @@ int main(int argc, char** argv) {
+             // blocking tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays
+             if (o.adapt_async && !src.exchange_pinned())
+                 adapt_async_off("the exchange buffers could not be page-locked");
+-            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
+-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
++            const int64_t solo_exchange_swaps = o.peer_ram_dedup ? std::max(o.adapt_swaps, o.peer_adapt_swaps) : o.adapt_swaps;
++            const int64_t exchange_swaps = o.batch_adapt_every > 0 ? std::max<int64_t>(solo_exchange_swaps, o.batch_adapt_swaps) : solo_exchange_swaps;
++            if ((o.adapt_every > 0 || o.batch_adapt_every > 0) && exchange_swaps > 0 &&
++                !src.reserve_exchanges(std::min<int64_t>(exchange_swaps, 96), err)) {
+                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
+                 return 1;
+             }
+@@ -7754,6 +7819,9 @@ int main(int argc, char** argv) {
+                          (long long) xcache.resident(),
+                          o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
+                                                                 : "off");
++        } else if (o.peer_ram_dedup) {
++            std::fprintf(stderr, "strata generate: peer RAM dedup: the resident RAM copy failed: %s\n", err.c_str());
++            return 1;
+         } else if (o.resident_soft) {
+             std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
+                                  "GPU does not hold are read from the model folder through the OS file cache "
+@@ -8581,6 +8649,7 @@ int main(int argc, char** argv) {
+         }
+         ver.set_remote_expert_opt(remote_opt.get());
+         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
++        if (o.peer_decode_p2p) ver.set_peer_decode_p2p(peer.device(), o.peer_decode_fast_join);
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+@@ -9420,7 +9489,7 @@ int main(int argc, char** argv) {
+                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
+                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+         }
+-        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
++        if (((o.adapt_every > 0 && o.adapt_swaps > 0) || o.batch_adapt_every > 0) && !all_experts_resident)
+             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+         PcieAuto pcie_auto;
+         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
+@@ -9694,9 +9763,10 @@ int main(int argc, char** argv) {
+         std::function<void()> adapt_fence;
+         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
+         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+-        auto adapt = [&]() -> bool {
++        auto adapt = [&](int batch_limit = -1, int64_t* primary_swaps = nullptr) -> bool {
+             if (!pending.empty()) return true;   // the previous swaps are still in flight
+-            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
++            const int limit = batch_limit >= 0 ? batch_limit : o.adapt_swaps;
++            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, limit, *srcp)) return false;
+             struct Swap { float gain; int32_t layer, in, out; };
+             std::vector<Swap> swaps;
+             std::vector<std::pair<float, int32_t>> cand, vict;
+@@ -9720,7 +9790,7 @@ int main(int argc, char** argv) {
+                 }
+             }
+             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
++            if ((int) swaps.size() > limit) swaps.resize((size_t) limit);
+             if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
+                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
+                 agate.landed.store(-1, std::memory_order_release);
+@@ -9843,15 +9913,19 @@ int main(int argc, char** argv) {
+             // is empty
+             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
+             if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
++                // The deduplicated tiers share RAM exchange buffers. Finish the primary's ownership transfer
++                // before the peer reuses them; adapt_ram finishes its own transfer before returning.
++                if (o.peer_ram_dedup) apply_pending(true);
+                 std::vector<int32_t> r0 = host_res;
+                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
+                 std::string perr;
+                 if (!peer.adapt(drive.d.usage.data(), r0.data(),
+-                                o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
++                                batch_limit >= 0 ? batch_limit : o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
+                     std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
+                     return false;
+                 }
+             }
++            if (primary_swaps) *primary_swaps += (int64_t) swaps.size();
+             for (float& v : drive.d.usage) v *= o.adapt_decay;
+             return true;
+         };
+@@ -10484,6 +10558,10 @@ int main(int argc, char** argv) {
+                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+         }
++        std::printf("INFO batch_mtp=%d\n", batch_mtp ? 1 : 0);
++        if (o.peer_decode_p2p) std::printf("INFO peer_decode=p2p\n");
++        if (o.peer_decode_fast_join) std::printf("INFO peer_fast_join=1\n");
++        if (o.batch_adapt_every > 0) std::printf("INFO batch_adapt_every=%d batch_adapt_swaps=%d\n", o.batch_adapt_every, o.batch_adapt_swaps);
+         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
+         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
+         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
+@@ -10870,6 +10948,9 @@ int main(int argc, char** argv) {
+         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
+         // so it keeps the conversation it holds
++        int64_t batch_adapt_rounds = 0, batch_adapt_last = 0, batch_primary_swaps = 0, batch_peer_swaps = 0;
++        double batch_adapt_ms = 0;
++        bool batch_prompt_read = false;
+         auto batch_step = [&]() -> bool {
+             int S = 0;
+             int rows[strata::kernels::kVerifyMaxT] = {};
+@@ -10922,6 +11003,8 @@ int main(int argc, char** argv) {
+             }
+             if (bt_windows == 0) {
+                 bt_start = Clock::now();
++                batch_adapt_rounds = batch_adapt_last = batch_primary_swaps = batch_peer_swaps = 0;
++                batch_adapt_ms = 0;
+                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
+                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
+                 bt_stage_wait0.assign(stages.size() + 1, 0.0);
+@@ -10950,7 +11033,7 @@ int main(int argc, char** argv) {
+                 bool ok = true;
+                 ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
+             } adapt_run;
+-            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
++            if (!drive.d.usage.empty() && o.adapt_every > 0 && o.batch_adapt_every == 0 && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
+                 adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
+             // Accept the proposal only when the target picked it and there is room to emit both tokens.
+             std::vector<int> keep(bs.size(), 0);
+@@ -11029,6 +11112,25 @@ int main(int argc, char** argv) {
+             }
+             std::fflush(stdout);
+             bt_emit += msd(w2, Clock::now());
++            if (o.batch_adapt_every > 0 && bt_windows - batch_adapt_last >= o.batch_adapt_every &&
++                !batch_prompt_read && !drive.d.usage.empty() &&
++                std::none_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return !p.lent.empty(); })) {
++                // Every verifier and its commit have completed. RAM ownership exchanges and residency uploads
++                // must finish here, before another window, prompt loan or admission can observe the tables.
++                const auto start = Clock::now();
++                const int64_t peer_before = peer.swaps();
++                apply_pending(true);
++                if (!adapt(o.batch_adapt_swaps, &batch_primary_swaps)) {
++                    std::printf("ERR batch adaptive expert exchange failed\n");
++                    strata::core::progress().busy.store(was_busy);
++                    return false;
++                }
++                apply_pending(true);
++                batch_peer_swaps += peer.swaps() - peer_before;
++                batch_adapt_last = bt_windows;
++                ++batch_adapt_rounds;
++                batch_adapt_ms += msd(start, Clock::now());
++            }
+             if (adapt_run.th.joinable()) {
+                 const Clock::time_point wa = Clock::now();
+                 adapt_run.th.join();
+@@ -11076,6 +11178,10 @@ int main(int argc, char** argv) {
+                              (drive.d.pcie_experts - bt_pcie0) / (w * L), e_vram / w, 100.0 * e_vram / e_all, e_pcie / w,
+                              100.0 * e_pcie / e_all, e_cpu / w, 100.0 * e_cpu / e_all, adapt_txt,
+                              1000.0 * bt_rows / std::max(wall, 1e-9), wall);
++                if (o.batch_adapt_every > 0)
++                    std::fprintf(stderr, "strata batch adaptive tier: %lld rounds, %lld primary + %lld peer swaps, %.3f ms total (%.3f ms/window)\n",
++                                 (long long) batch_adapt_rounds, (long long) batch_primary_swaps, (long long) batch_peer_swaps,
++                                 batch_adapt_ms, batch_adapt_ms / w);
+                 for (size_t k = 0; k <= stages.size(); ++k) {
+                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
+                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
+@@ -13400,8 +13506,10 @@ int main(int argc, char** argv) {
+                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
+                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
+                 const auto tsp = Clock::now();
++                if (o.batch_adapt_every > 0) batch_prompt_read = true;
+                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
++                if (o.batch_adapt_every > 0) batch_prompt_read = false;
+                 if (sp_ok) pp_exact = true;
+                 if (trace) {
+                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
+@@ -14360,7 +14468,7 @@ int main(int argc, char** argv) {
+                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
+                 bool adapt_ok = true;
+                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
+-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
++                if (!drive.d.usage.empty() && o.adapt_every > 0 && !ajob && ((rounds + 1) % o.adapt_every) == 0)
+                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                 if (!ver.commit(a + 1, err)) {
+                     if (adapt_thr.joinable()) adapt_thr.join();
+@@ -14766,6 +14874,16 @@ int main(int argc, char** argv) {
+             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
+                 std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
+                                      "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
++            if (o.peer_ram_dedup)
++                std::fprintf(stderr, "strata serve: peer RAM dedup: %lld adaptive peer swaps committed since start\n",
++                             (long long) peer.swaps());
++            if (const auto* p = ver.peer_decode_transport())
++                std::fprintf(stderr, "strata serve: peer decode P2P: %llu submissions, %.2f MiB input, %.2f MiB output; "
++                                     "peer host wait %.3f ms; GPU input/compute/output %.3f/%.3f/%.3f ms; "
++                                     "RAM exchanges %.3f ms (cumulative%s)\n",
++                             (unsigned long long) p->submissions, (double) p->input_bytes / (1 << 20),
++                             (double) p->output_bytes / (1 << 20), peer.ms_wait, p->input_ms, p->compute_ms, p->output_ms, peer.ms_ram_exchange,
++                             std::getenv("STRATA_DECODE_TIMING") ? ", GPU timing on" : ", GPU timing off");
+             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
+                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
+                                      "%.1f ms per round (start to flip, between windows)",
+diff --git a/tests/core/peer_decode_p2p_test.cpp b/tests/core/peer_decode_p2p_test.cpp
+new file mode 100644
+index 00000000..5847ba09
+--- /dev/null
++++ b/tests/core/peer_decode_p2p_test.cpp
+@@ -0,0 +1,246 @@
++#include "strata/core/peer_decode.hpp"
++#include "strata/core/on_device.hpp"
++
++#include <cuda_runtime.h>
++#include <chrono>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <thread>
++#include <vector>
++
++namespace {
++void require(bool ok, const std::string& e) { if (!ok) throw std::runtime_error(e); }
++void cuda_ok(cudaError_t e) { require(e == cudaSuccess, cudaGetErrorString(e)); }
++
++struct Watchdog {
++    std::atomic<bool> done{false};
++    std::thread thread;
++    explicit Watchdog(strata::core::PeerDecodeTransport& t) : thread([this, &t] {
++        for (int i = 0; i < 600 && !done.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        if (!done.load()) t.release();
++    }) {}
++    void finish() { done.store(true); if (thread.joinable()) thread.join(); }
++    ~Watchdog() { finish(); }
++};
++
++void run(bool timing, bool combined, bool fast = false, bool use_fast = true) {
++    using namespace strata::core;
++    constexpr int width = 2560, capacity = 80;
++    std::string err;
++#if defined(_WIN32)
++    _putenv_s("STRATA_DECODE_TIMING", timing ? "1" : "");
++#else
++    if (timing) setenv("STRATA_DECODE_TIMING", "1", 1); else unsetenv("STRATA_DECODE_TIMING");
++#endif
++    PeerDecodeTransport transport;
++    transport.set_fast_join(fast);
++    require(transport.open(0, 1, width, capacity, 2, err), err);
++    Watchdog watchdog(transport);
++    float *input = nullptr, *parts = nullptr, *peer_input = nullptr, *peer_rows = nullptr, *primary_hits = nullptr;
++    int32_t* peer_dst = nullptr;
++    int32_t* primary_dst = nullptr;
++    int32_t* primary_count = nullptr;
++    float* cpu_h = nullptr;
++    float* cpu_m = nullptr;
++    uint32_t* skip = nullptr;
++    uint32_t *cpu_ready_h = nullptr, *cpu_ready_m = nullptr;
++    cudaStream_t primary_stream = nullptr, peer_stream = nullptr;
++    cudaGraph_t graph = nullptr;
++    cudaGraphExec_t exec = nullptr;
++    const size_t floats = (size_t) capacity * width, bytes = floats * sizeof(float);
++    {
++        OnDevice on(0);
++        cuda_ok(cudaMalloc((void**) &input, bytes));
++        cuda_ok(cudaMalloc((void**) &parts, bytes * 2));
++        if (fast) cuda_ok(cudaMalloc((void**) &primary_hits, bytes * 2));
++        cuda_ok(cudaMalloc((void**) &skip, 4));
++        cuda_ok(cudaMalloc((void**) &primary_dst, capacity * 4));
++        cuda_ok(cudaMalloc((void**) &primary_count, 4));
++        cuda_ok(cudaHostAlloc((void**) &cpu_h, bytes * 2, cudaHostAllocPortable | cudaHostAllocMapped));
++        cuda_ok(cudaHostGetDevicePointer((void**) &cpu_m, cpu_h, 0));
++        if (fast) {
++            cuda_ok(cudaHostAlloc((void**) &cpu_ready_h, 4, cudaHostAllocPortable | cudaHostAllocMapped));
++            cuda_ok(cudaHostGetDevicePointer((void**) &cpu_ready_m, cpu_ready_h, 0));
++            *cpu_ready_h = 0;
++        }
++        std::vector<int32_t> local;
++        for (int i = 0; i < capacity; ++i) if (i % 11 == 0) local.push_back(i);
++        const int32_t nlocal = (int32_t) local.size();
++        cuda_ok(cudaMemcpy(primary_dst, local.data(), local.size() * 4, cudaMemcpyHostToDevice));
++        cuda_ok(cudaMemcpy(primary_count, &nlocal, 4, cudaMemcpyHostToDevice));
++        cuda_ok(cudaMemset(skip, 0, 4));
++        cuda_ok(cudaStreamCreateWithFlags(&primary_stream, cudaStreamNonBlocking));
++        cuda_ok(cudaStreamBeginCapture(primary_stream, cudaStreamCaptureModeThreadLocal));
++        if (combined) {
++            transport.copy_cpu_rows(0, parts, cpu_m, capacity, 1, skip, primary_dst, primary_count,
++                                    primary_stream, primary_hits, cpu_ready_m, use_fast);
++            transport.copy_cpu_rows(1, parts + floats, cpu_m + floats, capacity, 2, nullptr, primary_dst, primary_count,
++                                    primary_stream, primary_hits ? primary_hits + floats : nullptr, cpu_ready_m, use_fast);
++        } else {
++            transport.merge(0, parts, capacity, 1, skip, primary_stream);
++            transport.merge(1, parts + floats, capacity, 2, nullptr, primary_stream);
++        }
++        cuda_ok(cudaStreamEndCapture(primary_stream, &graph));
++        cuda_ok(cudaGraphInstantiate(&exec, graph, 0));
++    }
++    {
++        OnDevice on(1);
++        cuda_ok(cudaMalloc((void**) &peer_input, bytes));
++        cuda_ok(cudaMalloc((void**) &peer_rows, bytes));
++        cuda_ok(cudaMalloc((void**) &peer_dst, capacity * 4));
++        cuda_ok(cudaStreamCreateWithFlags(&peer_stream, cudaStreamNonBlocking));
++    }
++    std::vector<float> activations(floats), rows[2], expected(floats * 2), actual(floats * 2), copied(floats);
++    std::vector<float> hits(floats * 2);
++    std::vector<int32_t> dst[2];
++    int passes = 0;
++    for (int tokens : {1, 4, 8}) for (int repeat = 0; repeat < 12; ++repeat) {
++        // Both groups share the peer scratch, just as the real peer does. Sparse destinations must survive
++        // a captured graph replay; untouched rows retain their sentinel, including after an empty submission.
++        require(transport.reset_window(err), err);
++        if (fast) {
++            *(volatile uint32_t*) cpu_ready_h = 0;
++            std::atomic_thread_fence(std::memory_order_seq_cst);
++        }
++        std::memset(expected.data(), 0xA5, bytes * 2);
++        for (size_t i = 0; i < floats; ++i) activations[i] = (float) ((int) (i % 127) - 63 + repeat) * 0.125f;
++        const bool all_primary = repeat % 4 == 0;
++        if (fast) for (size_t i = 0; i < hits.size(); ++i)
++            hits[i] = i % 7 == 0 ? -0.0f : (float) ((int) (i % 131) - 65 + repeat) * 1048576.0f;
++        if (combined) {
++            for (size_t i = 0; i < floats * 2; ++i) cpu_h[i] = (float) ((int) (i % 193) - 96 + repeat) * 0.25f;
++            std::memcpy(expected.data(), cpu_h, bytes * 2);
++            for (int g = 0; g < 2; ++g) for (int row = 0; row < capacity; ++row)
++                if ((g == 0 && all_primary) || row % 11 == 0) {
++                    const size_t start = (size_t) g * floats + (size_t) row * width;
++                    for (int c = 0; c < width; ++c) expected[start + c] = fast && use_fast ? 0.0f + hits[start + c] : 0.0f;
++                }
++        }
++        const uint32_t skip_value = all_primary ? 1 : 0;
++        // Both arrival orders: CPU ready before the peer, or only after the peer has finished its stores.
++        if (fast && repeat % 2 == 0) {
++            std::atomic_thread_fence(std::memory_order_seq_cst);
++            *(volatile uint32_t*) cpu_ready_h = 2;
++        }
++        {
++            OnDevice on(0);
++            cuda_ok(cudaMemcpy(input, activations.data(), bytes, cudaMemcpyHostToDevice));
++            if (fast) cuda_ok(cudaMemcpy(primary_hits, hits.data(), bytes * 2, cudaMemcpyHostToDevice));
++            cuda_ok(cudaMemcpy(skip, &skip_value, 4, cudaMemcpyHostToDevice));
++            cuda_ok(cudaMemset(parts, 0xA5, bytes * 2));
++        }
++        for (int group = 0; group < 2; ++group) {
++            const int count = repeat % 3 == group ? 0 : tokens * 4;
++            dst[group].resize((size_t) count);
++            rows[group].resize((size_t) count * width);
++            int pick = 0;
++            for (int r = 0; r < count; ++r) {
++                int selected;
++                do { selected = (pick++ * 7 + repeat) % capacity; } while (combined && selected % 11 == 0);
++                dst[group][r] = selected; // unique, noncontiguous router-entry positions
++                for (int c = 0; c < width; ++c) rows[group][(size_t) r * width + c] =
++                    (float) ((r * 31 + c + repeat * 13 + group * 17) % 1001 - 500) * 0.0625f;
++                if (!(group == 0 && all_primary))
++                    std::memcpy(expected.data() + (size_t) group * floats + (size_t) dst[group][r] * width,
++                                rows[group].data() + (size_t) r * width, width * sizeof(float));
++            }
++        }
++        {
++            OnDevice on(0);
++            cuda_ok(cudaGraphLaunch(exec, primary_stream));
++        }
++        bool copied_input = false;
++        {
++            OnDevice on(1);
++            for (int group = 0; group < 2; ++group) {
++                if (group == 0 && all_primary) continue; // no host callback at all for the device-plan skip
++                const int count = (int) dst[group].size();
++                if (count) {
++                    cuda_ok(cudaMemcpyAsync(peer_rows, rows[group].data(), rows[group].size() * sizeof(float), cudaMemcpyHostToDevice, peer_stream));
++                    cuda_ok(cudaMemcpyAsync(peer_dst, dst[group].data(), dst[group].size() * sizeof(int32_t), cudaMemcpyHostToDevice, peer_stream));
++                }
++                require(transport.copy_input(peer_input, input, count ? (size_t) tokens * width : 0, peer_stream, err), err);
++                copied_input |= count > 0;
++                require(transport.submit(group, peer_rows, peer_dst, count, (uint32_t) group + 1, peer_stream, err), err);
++            }
++            if (fast && repeat % 2) cuda_ok(cudaStreamSynchronize(peer_stream));
++        }
++        if (fast && repeat % 2) {
++            std::atomic_thread_fence(std::memory_order_seq_cst);
++            *(volatile uint32_t*) cpu_ready_h = 2;
++        }
++        {
++            OnDevice on(0);
++            cuda_ok(cudaStreamSynchronize(primary_stream));
++            require(transport.complete(err), err);
++            cuda_ok(cudaMemcpy(actual.data(), parts, bytes * 2, cudaMemcpyDeviceToHost));
++        }
++        require(std::memcmp(actual.data(), expected.data(), bytes * 2) == 0, "P2P sparse result bytes differ");
++        require(transport.drain(err), err);
++        {
++            OnDevice on(1);
++            cuda_ok(cudaMemcpy(copied.data(), peer_input, (size_t) tokens * width * sizeof(float), cudaMemcpyDeviceToHost));
++        }
++        if (copied_input)
++            require(std::memcmp(copied.data(), activations.data(), (size_t) tokens * width * sizeof(float)) == 0, "P2P input bytes differ");
++        ++passes;
++    }
++    // An aborted graph must drain even with no submission and its transport must reject another window.
++    require(transport.reset_window(err), err);
++    if (fast) {
++        *(volatile uint32_t*) cpu_ready_h = 0;
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++    }
++    {
++        OnDevice on(0);
++        cuda_ok(cudaMemset(skip, 0, 4));
++        cuda_ok(cudaGraphLaunch(exec, primary_stream));
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    transport.release();
++    {
++        OnDevice on(0);
++        cuda_ok(cudaStreamSynchronize(primary_stream));
++    }
++    require(!transport.reset_window(err), "aborted transport was rearmed");
++    require(!transport.complete(err), "aborted transport was reported as valid");
++    watchdog.finish();
++    transport.close();
++    {
++        OnDevice on(0);
++        cuda_ok(cudaGraphExecDestroy(exec)); cuda_ok(cudaGraphDestroy(graph));
++        cuda_ok(cudaStreamDestroy(primary_stream)); cuda_ok(cudaFree(input)); cuda_ok(cudaFree(parts)); cuda_ok(cudaFree(skip));
++        cuda_ok(cudaFree(primary_dst)); cuda_ok(cudaFree(primary_count)); cuda_ok(cudaFreeHost(cpu_h));
++        if (primary_hits) cuda_ok(cudaFree(primary_hits));
++        if (cpu_ready_h) cuda_ok(cudaFreeHost(cpu_ready_h));
++    }
++    {
++        OnDevice on(1);
++        cuda_ok(cudaStreamDestroy(peer_stream)); cuda_ok(cudaFree(peer_input)); cuda_ok(cudaFree(peer_rows)); cuda_ok(cudaFree(peer_dst));
++    }
++    std::printf("peer decode P2P: timing=%d combined_CPU_rows=%d fast_join=%d use_fast=%d, %d captured two-group windows, exact bytes, skip/empty/abort PASS\n",
++                timing, combined, fast, use_fast, passes);
++}
++}
++
++int main() {
++    int count = 0, a = 0, b = 0;
++    if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2 ||
++        cudaDeviceCanAccessPeer(&a, 0, 1) != cudaSuccess || cudaDeviceCanAccessPeer(&b, 1, 0) != cudaSuccess || !a || !b) {
++        std::puts("peer_decode_p2p_test: SKIP (two GPUs with bidirectional P2P required)"); return 77;
++    }
++    try {
++        for (int device : {0, 1}) {
++            strata::core::OnDevice on(device);
++            cuda_ok(cudaDeviceEnablePeerAccess(1 - device, 0));
++        }
++        run(false, false); run(true, false); run(false, true); run(true, true);
++        run(false, true, true); run(true, true, true);
++        run(false, true, true, false); run(true, true, true, false);
++    }
++    catch (const std::exception& e) { std::fprintf(stderr, "peer_decode_p2p_test: %s\n", e.what()); return 1; }
++    return 0;
++}
+diff --git a/tests/core/peer_ram_dedup_test.cpp b/tests/core/peer_ram_dedup_test.cpp
+new file mode 100644
+index 00000000..4170bd2a
+--- /dev/null
++++ b/tests/core/peer_ram_dedup_test.cpp
+@@ -0,0 +1,144 @@
++#include "strata/core/peer_experts.hpp"
++#include "strata/core/on_device.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++
++void require(bool ok, const std::string& message) {
++    if (!ok) throw std::runtime_error(message);
++}
++
++struct Fixture {
++    std::filesystem::path path = std::filesystem::temp_directory_path() /
++        ("strata-peer-ram-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    Fixture() { std::filesystem::create_directories(path); }
++    ~Fixture() { std::error_code e; std::filesystem::remove_all(path, e); }
++};
++
++void run(bool uniform, bool pin, bool rotate) {
++    using namespace strata::core;
++    using namespace strata::kernels::cpu;
++    constexpr int layers = 2, experts = 5;
++#if defined(_WIN32)
++    _putenv_s("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0");
++#else
++    setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
++#endif
++    require(cudaSetDevice(0) == cudaSuccess, "select CUDA0");
++    Fixture fixture;
++    std::string err;
++    NativeFmt fmt[layers];
++    require(native_fmt(18, 20, 2560, 640, fmt[0], err), err);
++    require(native_fmt(uniform ? 18 : 17, 20, 2560, 640, fmt[1], err), err);
++    std::vector<std::vector<uint8_t>> truth(layers * experts);
++    {
++        std::ofstream metadata(fixture.path / "native_experts.txt");
++        std::ofstream weights(fixture.path / "experts.bin", std::ios::binary);
++        uint64_t offset = 0;
++        for (int l = 0; l < layers; ++l) {
++            metadata << l << ' ' << (l == 0 || uniform ? 18 : 17) << " 20 " << offset << ' ' << fmt[l].bytes << '\n';
++            for (int e = 0; e < experts; ++e) {
++                auto& data = truth[l * experts + e];
++                data.resize((size_t) fmt[l].bytes);
++                for (size_t i = 0; i < data.size(); ++i) data[i] = (uint8_t) ((i * 131 + e * 37 + l * 17) ^ (i >> 8));
++                weights.write((const char*) data.data(), (std::streamsize) data.size());
++            }
++            offset += (uint64_t) experts * fmt[l].bytes;
++        }
++        require((bool) metadata && (bool) weights, "write fixture");
++    }
++    require(expert_layout_load(fixture.path.string(), layers, experts, err), err);
++    FileExpertSource source;
++    ExpertCache primary;
++    PeerExperts peer;
++    require(source.open(fixture.path.string(), layers, experts, err), err);
++    const int64_t max_blob = std::max(fmt[0].bytes, fmt[1].bytes);
++    require(primary.open(2, layers, experts, max_blob, err), err);
++    for (int l = 0; l < layers; ++l) {
++        int slot = primary.admit(l, 0);
++        require(slot >= 0 && primary.fill_slot_blocking(slot, truth[l * experts].data(), err), err);
++    }
++    std::vector<std::pair<int32_t, int32_t>> rank;
++    for (int e = 0; e < experts; ++e)
++        for (int l = 0; l < layers; ++l) rank.emplace_back(l, e);
++    require(peer.open(1, rank, primary, source, layers, experts, 512, 2, err), err);
++    require(peer.resident_pairs() == std::vector<std::pair<int32_t, int32_t>>{{0,1},{1,1}}, "peer startup placement");
++    // Experts 0: primary; 1: peer; 2/3: RAM; 4: file-only. Exercise the budget path and file-only promotions.
++    const uint64_t ram_bytes = 2 * (uint64_t) (fmt[0].bytes + fmt[1].bytes);
++    require(source.pin_cache_complement(primary, err, pin, peer.resident_pairs(), -1, 0, ram_bytes, &rank), err);
++    require(source.resident_bytes() == ram_bytes, "both GPU tiers must be excluded from RAM");
++    require(source.reserve_exchanges(2, err), err);
++    require(peer.enable_ram_dedup(source, err), err);
++    require(source.exchange_rotation() == (uniform && pin && rotate), "exchange rotation mode");
++    std::vector<int32_t> r0(layers * experts, kNotResident);
++    for (int l = 0; l < layers; ++l) r0[l * experts] = primary.slot_of(l, 0);
++
++    auto check = [&] {
++        require(source.resident_bytes() == ram_bytes, "RAM allocation grew during adaptation");
++        for (int l = 0; l < layers; ++l)
++            for (int e = 0; e < experts; ++e) {
++                const bool p = primary.slot_of(l, e) >= 0, q = peer.has(l, e), r = source.has_resident(l, e);
++                require((int) p + (int) q + (int) r == (e == 4 ? 0 : 1), "lost or duplicated expert ownership");
++                const auto& expected = truth[l * experts + e];
++                if (r) require(std::memcmp(source.resident_blob(l, e), expected.data(), expected.size()) == 0, "RAM expert bytes changed");
++                if (q) {
++                    OnDevice on(1);
++                    std::vector<uint8_t> actual(expected.size());
++                    require(cudaMemcpy(actual.data(), peer.slot_ptr(l, e), actual.size(), cudaMemcpyDeviceToHost) == cudaSuccess,
++                            "read peer slot");
++                    require(actual == expected, "peer expert bytes changed");
++                }
++            }
++        std::vector<uint8_t> fallback((size_t) fmt[1].bytes);
++        require(source.copy_blob(1, 4, fallback.data()) && fallback == truth[experts + 4], "file fallback changed");
++    };
++    check();
++    for (int round = 0; round < 12; ++round) {
++        const int incoming = (round + 1) % 3 + 1; // 2 -> 3 -> 1, repeatedly evict and readmit the same experts.
++        std::vector<float> usage(layers * experts, 0.0f);
++        for (int l = 0; l < layers; ++l) {
++            usage[l * experts + incoming] = 10 + l;
++            usage[l * experts + 4] = 100; // no RAM place: must be skipped rather than losing an eviction.
++        }
++        require(peer.adapt(usage.data(), r0.data(), 2, err), err);
++        for (int l = 0; l < layers; ++l) require(peer.has(l, incoming), "hot RAM expert was not promoted");
++        check();
++    }
++    require(peer.swaps() == 24 && source.exchanges() == 24, "exchange accounting");
++    std::printf("peer RAM dedup: uniform=%d pinned=%d rotate=%d, 24 exchanges, ownership and exact bytes PASS\n",
++                uniform, pin, rotate);
++    peer.close();
++    require(peer.resident_pairs().empty(), "closed peer retained published residency");
++}
++
++} // namespace
++
++int main() {
++    int devices = 0;
++    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
++        std::puts("peer_ram_dedup_test: SKIP (needs two visible GPUs)");
++        return 77;
++    }
++    try {
++        run(false, true, false);
++        run(false, false, false);
++        run(true, true, true);
++        std::puts("peer_ram_dedup_test: PASS");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "peer_ram_dedup_test: %s\n", e.what());
++        return 1;
++    }
++}

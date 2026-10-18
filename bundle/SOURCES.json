@@ -1,0 +1,33 @@
+{
+  "upstream": {
+    "version": "0.1.45",
+    "commit": "477ac13cbe8e582c20484871ce459d20d82df09d",
+    "url": "https://github.com/Niko1221/Strata/archive/refs/tags/v0.1.45.tar.gz",
+    "archive_sha256": "bb88e14e8b4fa26bf9cc74dc77645576d4ca5d10f5559a95171b0ac3209b33ce"
+  },
+  "ggml": {
+    "pinned_llama_cpp_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+    "url": "https://github.com/ggml-org/llama.cpp",
+    "files": "payload/ggml-files.json"
+  },
+  "p2p": {
+    "patch_sha256": "44bac870b0f0fe95f5253d3b7987e7bbcc79c365a1e7c98eba9372f5e4de6309",
+    "changed_files": [
+      "CMakeLists.txt",
+      "include/strata/core/expert_source.hpp",
+      "include/strata/core/peer_decode.hpp",
+      "include/strata/core/peer_experts.hpp",
+      "include/strata/core/verify.hpp",
+      "src/core/expert_source.cpp",
+      "src/core/peer_decode.cu",
+      "src/core/peer_decode_stub.cpp",
+      "src/core/peer_experts.cpp",
+      "src/core/verify.cpp",
+      "src/program/generate.cpp",
+      "tests/core/peer_decode_p2p_test.cpp",
+      "tests/core/peer_ram_dedup_test.cpp"
+    ],
+    "measured_engine_sha256": "d519946b0393aa30a92682b407b9e97c2501b976bde045d1a03dee4fec625964",
+    "validation": "Ubuntu 24.04 x86_64; CUDA 12.8; two RTX 2080 Ti 22 GiB, NVLink"
+  }
+}
